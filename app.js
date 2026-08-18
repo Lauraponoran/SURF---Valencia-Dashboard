@@ -689,9 +689,9 @@ function updateStatsVisibility() {
   if (sensorLegend) sensorLegend.style.display = isFilteredMode() ? 'none' : 'block';
 }
 
-const sensorLegend = document.getElementById('sensorLegend');
-sensorLegend.addEventListener('scroll', () => {
-  sensorLegend.classList.toggle('is-scrolled', sensorLegend.scrollTop > 0);
+const sensorLegendEl = document.getElementById('sensorLegend');
+sensorLegendEl.addEventListener('scroll', () => {
+  sensorLegendEl.classList.toggle('is-scrolled', sensorLegendEl.scrollTop > 0);
 });
 
 window.addEventListener('resize', updateStatsVisibility);

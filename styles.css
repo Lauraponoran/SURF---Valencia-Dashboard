@@ -355,7 +355,9 @@ input[type="range"] {
 #sensorLegend h4 {
   position: sticky;
   top: 0;
-  background: rgba(10, 16, 24, 0.97);
+  background: rgba(10, 16, 24, 0.3);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border-radius: 6px 6px 0 0;
   margin: -12px -12px 10px -12px;
   padding: 12px 12px 2px 12px;

@@ -689,6 +689,11 @@ function updateStatsVisibility() {
   if (sensorLegend) sensorLegend.style.display = isFilteredMode() ? 'none' : 'block';
 }
 
+const sensorLegend = document.getElementById('sensorLegend');
+sensorLegend.addEventListener('scroll', () => {
+  sensorLegend.classList.toggle('is-scrolled', sensorLegend.scrollTop > 0);
+});
+
 window.addEventListener('resize', updateStatsVisibility);
 
 function updateLegendPositions() {

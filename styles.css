@@ -355,9 +355,9 @@ input[type="range"] {
 #sensorLegend h4 {
   position: sticky;
   top: 0;
-  background: rgba(10, 16, 24, 0.08);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border-radius: 6px 6px 0 0;
   margin: -12px -12px 10px -12px;
   padding: 12px 12px 2px 12px;
@@ -365,6 +365,12 @@ input[type="range"] {
   width: calc(100% + 24px);
   box-sizing: border-box;
   text-align: center;
+  transition: background 0.15s ease, backdrop-filter 0.15s ease;
+}
+#sensorLegend.is-scrolled h4 {
+  background: rgba(10, 16, 24, 0.3);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 
 .speed-color-box {

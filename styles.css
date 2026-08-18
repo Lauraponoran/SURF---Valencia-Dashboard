@@ -355,7 +355,7 @@ input[type="range"] {
 #sensorLegend h4 {
   position: sticky;
   top: 0;
-  background: var(--sc-panel-bg);
+  background: rgb(10, 16, 24);
   margin-top: 0;
   padding-top: 12px;
   padding-bottom: 2px;

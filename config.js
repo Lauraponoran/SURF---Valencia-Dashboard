@@ -9,8 +9,8 @@ export const CONFIG = {
   MAP_STYLE: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
 
   // TODO: set to your city's center [lng, lat].
-  // Example — Tallinn, Estonia:
-  MAP_CENTER: [24.7536, 59.4370],
+  // Example — Valencia, Spain
+  MAP_CENTER: [-0.376288, 39.469907],
   MAP_ZOOM: 13,
 
   // Folder the map fetches trips.geojson / road_segments_averaged.json from.

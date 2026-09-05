@@ -901,7 +901,7 @@ function renderCrashLegend() {
   });
 }
 
-
+function setupBrakingLayer(geojson, labelLayerId) {
   const hotspotData = buildBrakingHotspots(geojson.features || []);
 
   map.addSource('braking-hotspots', { type: 'geojson', data: hotspotData });

@@ -25,6 +25,7 @@ let showAveragedSegments = false;
 let averagedSegmentMode = 'composite';
 let activeFilter = null;
 let showBraking = false;
+let showCrashes = false;
 let tripDates = {};        // trip_id -> 'YYYY-MM-DD'
 let selectedSensorFilters = new Set();
 let selectedDateFrom = '';
@@ -185,7 +186,7 @@ function hasAccordionFilter() {
 }
 
 function updateResetButtonVisibility() {
-  const active = showSpeedColors || showRoadQuality || showAveragedSegments || showBraking || !!activeFilter || !!selectedTrip || hasAccordionFilter();
+  const active = showSpeedColors || showRoadQuality || showAveragedSegments || showBraking || showCrashes || !!activeFilter || !!selectedTrip || hasAccordionFilter();
   document.getElementById('resetButton').style.display = active ? 'block' : 'none';
 }
 
@@ -267,11 +268,12 @@ function resetSelection() {
   showRoadQuality      = false;
   showAveragedSegments = false;
   showBraking          = false;
+  showCrashes          = false;
 
   if (currentPopup) { currentPopup.remove(); currentPopup = null; }
   applyTripFilter(null);
 
-  ['speedColorsCheckbox','roadQualityCheckbox','averagedSegmentsCheckbox','brakingCheckbox'].forEach(id => {
+  ['speedColorsCheckbox','roadQualityCheckbox','averagedSegmentsCheckbox','brakingCheckbox','crashCheckbox'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.checked = false;
   });
@@ -283,6 +285,8 @@ function resetSelection() {
   document.getElementById('averagedModeGroup').style.display      = 'none';
   const brakingLegend = document.getElementById('brakingLegend');
   if (brakingLegend) brakingLegend.style.display = 'none';
+  const crashLegend = document.getElementById('crashLegend');
+  if (crashLegend) crashLegend.style.display = 'none';
 
   if (map.getLayer('averaged-segments'))
     map.setLayoutProperty('averaged-segments', 'visibility', 'none');
@@ -290,6 +294,10 @@ function resetSelection() {
     map.setLayoutProperty('braking-hotspots-halo', 'visibility', 'none');
   if (map.getLayer('braking-hotspots-dot'))
     map.setLayoutProperty('braking-hotspots-dot', 'visibility', 'none');
+  if (map.getLayer('crash-events-halo'))
+    map.setLayoutProperty('crash-events-halo', 'visibility', 'none');
+  if (map.getLayer('crash-events-dot'))
+    map.setLayoutProperty('crash-events-dot', 'visibility', 'none');
 
   if (map.getLayer('trips-layer')) {
     map.setLayoutProperty('trips-layer', 'visibility', 'visible');
@@ -494,7 +502,406 @@ function buildBrakingHotspots(features, cellSize = BRAKING_CELL_SIZE_FULL) {
   return { type: 'FeatureCollection', features: hotspotFeatures };
 }
 
-function setupBrakingLayer(geojson, labelLayerId) {
+// ─── Crash / fall events (ported from Marineterrein-Commutes) ─────────────
+// Severity (colour), type (glyph artwork), and outcome (white ring) are
+// each baked directly into the marker's icon — see CRASH_SEVERITY_COLORS,
+// CRASH_GLYPHS, and drawCrashIcon() below.
+
+function getCrashTypeLabel(properties) {
+  if (properties.crash_type) return properties.crash_type;
+
+  // speed_at_impact_kmh can be null when there's no wheel-diameter data to
+  // estimate from. Number(null) === 0, not NaN, so without this explicit
+  // null check a missing-data event would silently fall through the
+  // Number.isFinite/speed<=1 branch below and get misread as a
+  // "Stationary Fall".
+  const rawSpeed = properties.preimpact_speed_kmh ?? properties.speed_at_impact_kmh;
+  if (rawSpeed == null) return 'Unclassified';
+
+  const speed = Number(rawSpeed);
+  if (!Number.isFinite(speed)) return 'Unclassified';
+  if (speed <= 1) return 'Stationary Fall';
+  if (speed <= 10) return 'Low-Speed Fall';
+  return 'High-Speed Fall';
+}
+
+function getCrashOutcomeLabel(properties) {
+  if (properties.crash_outcome) return properties.crash_outcome;
+
+  if (properties.unresolved === true || properties.unresolved === 'true') {
+    return 'Unresolved';
+  }
+
+  if (properties.came_to_stop === true || properties.came_to_stop === 'true') {
+    return 'Resolved';
+  }
+
+  return 'Unclassified';
+}
+
+function buildCrashFeatures(features) {
+  const crashFeatures = (features || [])
+    .filter(f =>
+      f?.geometry?.type === 'Point' &&
+      f?.properties?.event_type === 'crash'
+    )
+    .map(f => {
+      const crash_type = getCrashTypeLabel(f.properties || {});
+      const crash_outcome = getCrashOutcomeLabel(f.properties || {});
+      const severity = f.properties?.severity || 'Minor';
+      return {
+        ...f,
+        properties: {
+          ...f.properties,
+          crash_type,
+          crash_outcome,
+          crash_icon_id: crashIconId(
+            crash_type,
+            severity,
+            crash_outcome === 'Unresolved'
+          )
+        }
+      };
+    });
+  console.log(`🚨 Found ${crashFeatures.length} crash marker(s)`);
+  return { type: 'FeatureCollection', features: crashFeatures };
+}
+
+// Crash marker icons, drawn on canvas rather than rendered as map-font
+// text/circle layers — the vector basemap's fonts don't cover the glyph
+// shapes used here (◆ ▲ ● ■ fall outside standard Latin ranges).
+const CRASH_GLYPHS = {
+  // Arrow swoosh
+  'Stationary Fall': {
+    type: 'path',
+    d: 'M43.3,141.6s19.3-35.5,53.1-44.3c33.8-8.9,70.4,14,70.4,14l5.5-18.8c.1-.5.5-.8,1-1,.8-.3,1.6.1,1.9.9l18.3,53.7c0,.1,0,.2,0,.3,0,.8-.5,1.6-1.3,1.6l-53.3,5c-.4,0-.9-.1-1.2-.4-.6-.6-.6-1.5,0-2.1l15.3-16s-30.5-23.2-59.1-17.9c-28.6,5.3-50.6,24.9-50.6,24.9Z'
+  },
+  // Wifi-style signal arcs
+  'Low-Speed Fall': {
+    type: 'path',
+    d: 'M187.9,145.5c-17-38.7-62.1-60.5-103-49.8-1.5.4-2.3,2-1.7,3.4l3.1,7.8c.6,1.4,2.2,2.2,3.6,1.8,33.6-8.6,70.5,9.2,84.6,40.9.6,1.4,2.2,2.1,3.7,1.7l8.1-2.4c1.5-.5,2.3-2,1.6-3.5h0ZM161.3,153.8c-11.4-24.5-40-38.3-66.3-32.1-1.6.4-2.4,2-1.8,3.4l3.1,7.9c.5,1.4,2.1,2.2,3.5,1.9,19-4.3,39.6,5.7,48,23.2.6,1.3,2.2,2,3.7,1.6l8.1-2.4c1.5-.5,2.3-2.1,1.6-3.5Z'
+  },
+  // Zigzag impact spike — drawn stroked (source is a polyline), not filled
+  'High-Speed Fall': {
+    type: 'polyline',
+    points: [[68.5,167.8],[50.8,139.7],[79.9,139.7],[79.9,91.7],[123.1,138.1],[142.7,76.4],[167.5,127.2],[209.1,106.8],[209.1,141.8]],
+    strokeWidth: 19.8
+  },
+  // Triangle with a question mark
+  'Unclassified': {
+    type: 'path',
+    d: 'M184.2,161.2l-51-100.3c-2.8-5.6-7.5-5.6-10.3,0l-51,100.3c-2.8,5.6,0,10.1,6.4,10.1h99.6c6.3,0,9.2-4.5,6.4-10.1ZM126.3,163.1c-4.9,0-8.2-3.5-8.2-8.3,0-4.9,3.4-8.4,8.2-8.4,4.9,0,8.1,3.4,8.2,8.4,0,4.8-3.2,8.3-8.2,8.3ZM137.4,129c-3.3,3.7-4.7,7.3-4.7,11.4v1.6s-12.2,0-12.2,0v-2.3c-.4-4.7,1.2-9.5,5.3-14.4,3-3.5,5.3-6.5,5.3-9.6s-2.1-5.4-6.7-5.5c-3.1,0-6.7,1-9.1,2.7l-3.1-10c3.3-2,8.8-3.8,15.3-3.8,12.1,0,17.6,6.7,17.6,14.3s-4.4,11.6-7.9,15.4Z'
+  }
+};
+const CRASH_GLYPH_VIEWBOX = 256; // all path/point data above is in this coordinate space
+
+const CRASH_SEVERITY_COLORS = {
+  'Minor':  '#ffea00',
+  'Hard':   '#ff9100',
+  'Severe': '#ff1744'
+};
+
+function crashColorForSeverity(severity) {
+  return CRASH_SEVERITY_COLORS[severity] || CRASH_SEVERITY_COLORS.Minor;
+}
+
+// Small inline SVG version of a crash-type glyph, for the legend — reuses
+// the same path/polyline data as drawCrashIcon() so the legend and the map
+// markers always agree on what each glyph looks like.
+function crashGlyphSvg(crashType, color = '#cfcfcf') {
+  const glyph = CRASH_GLYPHS[crashType] || CRASH_GLYPHS['Unclassified'];
+  const inner = glyph.type === 'polyline'
+    ? `<polyline points="${glyph.points.map(p => p.join(',')).join(' ')}" fill="none" stroke="${color}" stroke-width="${glyph.strokeWidth}" stroke-linejoin="round" stroke-linecap="round"/>`
+    : `<path d="${glyph.d}" fill="${color}"/>`;
+  return `<svg viewBox="0 0 ${CRASH_GLYPH_VIEWBOX} ${CRASH_GLYPH_VIEWBOX}" width="16" height="16">${inner}</svg>`;
+}
+
+// Icon id encodes all three baked-in dimensions so distinct combinations
+// each get their own registered image.
+function crashIconId(crashType, severity, unresolved) {
+  const safeType = (crashType || 'Unclassified').replace(/[^a-zA-Z0-9]+/g, '_');
+  return `crash-icon-${safeType}-${severity}-${unresolved ? 'ring' : 'plain'}`;
+}
+
+// Renders one crash-type glyph as a round badge: dark disc, a severity-
+// coloured ring, the glyph artwork in that same colour, and — for
+// unresolved crashes — an extra white ring outside it.
+function drawCrashIcon(crashType, color, unresolved, size = 40) {
+  const glyph = CRASH_GLYPHS[crashType] || CRASH_GLYPHS['Unclassified'];
+  const canvas = document.createElement('canvas');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = size * dpr;
+  canvas.height = size * dpr;
+  const ctx = canvas.getContext('2d');
+
+  const scale = (size * dpr) / CRASH_GLYPH_VIEWBOX;
+  ctx.scale(scale, scale);
+
+  const cx = CRASH_GLYPH_VIEWBOX / 2;
+  const cy = CRASH_GLYPH_VIEWBOX / 2;
+  const discRadius = 118;
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, discRadius, 0, Math.PI * 2);
+  ctx.fillStyle = '#3a3838';
+  ctx.fill();
+
+  if (unresolved) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, discRadius + 6, 0, Math.PI * 2);
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = '#ffffff';
+    ctx.stroke();
+  }
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, discRadius - 5, 0, Math.PI * 2);
+  ctx.lineWidth = 10;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
+  if (glyph.type === 'polyline') {
+    ctx.beginPath();
+    glyph.points.forEach(([x, y], i) => {
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.lineWidth = glyph.strokeWidth;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.stroke();
+  } else {
+    ctx.fill(new Path2D(glyph.d));
+  }
+
+  return { width: canvas.width, height: canvas.height, data: ctx.getImageData(0, 0, canvas.width, canvas.height).data };
+}
+
+function ensureCrashIcons(crashFeatures) {
+  const seen = new Set();
+  (crashFeatures || []).forEach(f => {
+    const p = f.properties || {};
+    const id = p.crash_icon_id;
+    if (!id || seen.has(id) || map.hasImage(id)) return;
+    seen.add(id);
+    const severity = p.severity || 'Minor';
+    const unresolved = p.crash_outcome === 'Unresolved';
+    map.addImage(id, drawCrashIcon(p.crash_type, crashColorForSeverity(severity), unresolved), { pixelRatio: window.devicePixelRatio || 1 });
+  });
+}
+
+function setupCrashLayer(geojson, labelLayerId) {
+  const crashData = buildCrashFeatures(geojson.features || []);
+
+  ensureCrashIcons(crashData.features);
+
+  map.addSource('crash-events', {
+    type: 'geojson',
+    data: crashData
+  });
+
+  // Invisible tap-target circle — the visible marker is the icon below.
+  map.addLayer({
+    id: 'crash-events-halo',
+    type: 'circle',
+    source: 'crash-events',
+    layout: {
+      visibility: 'none'
+    },
+    paint: {
+      'circle-color': '#000000',
+      'circle-opacity': 0,
+      'circle-radius': [
+        'interpolate', ['linear'], ['zoom'],
+        10, 9,
+        14, 13,
+        17, 18
+      ],
+      'circle-pitch-alignment': 'map'
+    }
+  }, labelLayerId);
+
+  // The actual crash marker: severity (colour), type (glyph), outcome
+  // (white ring) all baked into a single raster icon (see drawCrashIcon).
+  map.addLayer({
+    id: 'crash-events-dot',
+    type: 'symbol',
+    source: 'crash-events',
+    layout: {
+      visibility: 'none',
+      'icon-image': ['get', 'crash_icon_id'],
+      'icon-size': [
+        'interpolate', ['linear'], ['zoom'],
+        10, 0.48,
+        14, 0.68,
+        17, 0.95
+      ],
+      'icon-allow-overlap': true,
+      'icon-ignore-placement': true
+    },
+    paint: {
+      'icon-opacity': 1
+    }
+  }, labelLayerId);
+
+  function showCrashPopup(e) {
+    e.preventDefault();
+    if (e.originalEvent) {
+      e.originalEvent.stopPropagation();
+    }
+
+    if (currentPopup) { currentPopup.remove(); }
+
+    const p = e.features[0].properties;
+
+    const speedLine = p.speed_at_impact_kmh != null
+      ? `🚴 Speed at impact: ${p.speed_at_impact_kmh} km/h`
+      : `🚴 Speed at impact: unknown`;
+
+    const crashType = getCrashTypeLabel(p);
+    const crashOutcome = getCrashOutcomeLabel(p);
+
+    const recoveryLine =
+      p.unresolved === true || p.unresolved === 'true'
+        ? `⚠️ <strong>Wheel never turned again</strong>`
+        : p.came_to_stop === true || p.came_to_stop === 'true'
+          ? `🧍 Came to a stop, moving again after ${p.recovery_time_s}s`
+          : `↪️ Kept moving — no stop detected nearby`;
+
+    currentPopup = new mapboxgl.Popup()
+      .setLngLat(e.lngLat)
+      .setHTML(`
+        <strong>🚨 ${p.severity} Impact</strong><br>
+        💥 Peak force: ${p.peak_g}g<br>
+        ⚡ Onset: ${p.suddenness_s}s to peak<br>
+        🚲 Classification: ${crashType}<br>
+        📍 Outcome: ${crashOutcome}<br>
+        ${speedLine}<br>
+        ${recoveryLine}<br>
+        🕐 ${p.time_str || 'time unknown'} · trip ${p.trip_id}
+      `)
+      .addTo(map);
+  }
+
+  map.on('click', 'crash-events-halo', showCrashPopup);
+  map.on('click', 'crash-events-dot',  showCrashPopup);
+
+  map.on('mouseenter', 'crash-events-halo', () => { map.getCanvas().style.cursor = 'pointer'; });
+  map.on('mouseleave', 'crash-events-halo', () => { map.getCanvas().style.cursor = ''; });
+  map.on('mouseenter', 'crash-events-dot',  () => { map.getCanvas().style.cursor = 'pointer'; });
+  map.on('mouseleave', 'crash-events-dot',  () => { map.getCanvas().style.cursor = ''; });
+
+  console.log('✅ Crash/fall layer added');
+}
+
+function setupCrashControls() {
+  const cb = document.getElementById('crashCheckbox');
+  if (!cb) return;
+
+  cb.addEventListener('change', (e) => {
+    showCrashes = e.target.checked;
+
+    const legend = document.getElementById('crashLegend');
+    const visibility = showCrashes ? 'visible' : 'none';
+
+    if (map.getLayer('crash-events-halo')) {
+      map.setLayoutProperty('crash-events-halo', 'visibility', visibility);
+    }
+    if (map.getLayer('crash-events-dot')) {
+      map.setLayoutProperty('crash-events-dot', 'visibility', visibility);
+    }
+    if (legend) {
+      legend.style.display = showCrashes ? 'block' : 'none';
+    }
+
+    updateResetButtonVisibility();
+    setTimeout(updateLegendPositions, 50);
+    updateStatsVisibility();
+  });
+}
+
+// Crash / fall legend — three dimensions (intensity / classification /
+// outcome), each shown as a collapsible category, ported from
+// Marineterrein-Commutes.
+const CRASH_LEGEND_CATEGORIES = [
+  {
+    id: 'intensity',
+    label: 'Intensity',
+    hint: 'Circle colour = impact severity',
+    rows: [
+      { swatch: `<div class="cl-swatch" style="background:#ffea00;"></div>`, label: 'Minor' },
+      { swatch: `<div class="cl-swatch" style="background:#ff9100;"></div>`, label: 'Hard' },
+      { swatch: `<div class="cl-swatch" style="background:#ff1744;"></div>`, label: 'Severe' },
+    ]
+  },
+  {
+    id: 'classification',
+    label: 'Classification',
+    hint: 'Symbol icon = type of event',
+    rows: [
+      { swatch: `<div class="cl-swatch cl-swatch--glyph">${crashGlyphSvg('Stationary Fall')}</div>`, label: 'Stationary Fall' },
+      { swatch: `<div class="cl-swatch cl-swatch--glyph">${crashGlyphSvg('Low-Speed Fall')}</div>`, label: 'Low-Speed Fall' },
+      { swatch: `<div class="cl-swatch cl-swatch--glyph">${crashGlyphSvg('High-Speed Fall')}</div>`, label: 'High-Speed Fall' },
+      { swatch: `<div class="cl-swatch cl-swatch--glyph">${crashGlyphSvg('Unclassified')}</div>`, label: 'Unclassified' },
+    ]
+  },
+  {
+    id: 'outcome',
+    label: 'Outcome',
+    hint: 'White ring = rider did not recover',
+    rows: [
+      { swatch: `<div class="cl-swatch cl-swatch--outcome"></div>`, label: 'Resolved' },
+      { swatch: `<div class="cl-swatch cl-swatch--outcome unresolved"></div>`, label: 'Unresolved (white ring)' },
+    ]
+  },
+];
+
+function renderCrashLegend() {
+  const legend = document.getElementById('crashLegend');
+  if (!legend) return;
+
+  legend.innerHTML = `
+    <strong>CRASHES &amp; FALLS</strong>
+    <p class="cl-sub">Tap a category to see what its colours &amp; symbols mean.</p>
+    ${CRASH_LEGEND_CATEGORIES.map((cat, i) => `
+      <button type="button" class="cl-cat" data-cat="${cat.id}" aria-expanded="false">
+        <span class="cl-cat-name">${cat.label}</span>
+        <span class="cl-chevron">▶</span>
+      </button>
+      <div class="cl-panel" data-panel="${cat.id}" data-open="false">
+        <p class="cl-sub" style="margin:0 0 6px;">${cat.hint}</p>
+        ${cat.rows.map(r => `
+          <div class="cl-row">
+            ${r.swatch}
+            <span class="cl-row-label">${r.label}</span>
+          </div>
+        `).join('')}
+      </div>
+    `).join('')}
+  `;
+
+  // Accordion behaviour: opening one category closes the others so the
+  // panel stays short rather than growing with every click.
+  legend.querySelectorAll('.cl-cat').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const catId = btn.dataset.cat;
+      const isOpen = btn.getAttribute('aria-expanded') === 'true';
+
+      legend.querySelectorAll('.cl-cat').forEach(b => b.setAttribute('aria-expanded', 'false'));
+      legend.querySelectorAll('.cl-panel').forEach(p => p.setAttribute('data-open', 'false'));
+
+      if (!isOpen) {
+        btn.setAttribute('aria-expanded', 'true');
+        const panel = legend.querySelector(`.cl-panel[data-panel="${catId}"]`);
+        if (panel) panel.setAttribute('data-open', 'true');
+      }
+    });
+  });
+}
+
+
   const hotspotData = buildBrakingHotspots(geojson.features || []);
 
   map.addSource('braking-hotspots', { type: 'geojson', data: hotspotData });
@@ -667,11 +1074,13 @@ map.on('load', async () => {
     });
 
     setupBrakingLayer(geojson, labelLayerId);
+    setupCrashLayer(geojson, labelLayerId);
     await setupAveragedSegments(labelLayerId);
 
     setupControls();
     updateStatsFromMetadata();
     renderSensorLegend();
+    renderCrashLegend();
     updateStatsVisibility();
 
   } catch (err) {
@@ -680,7 +1089,7 @@ map.on('load', async () => {
 });
 
 // ─── UI helpers ───────────────────────────────────────────────────────────────
-function isFilteredMode() { return showSpeedColors || showRoadQuality || showAveragedSegments || showBraking || !!activeFilter; }
+function isFilteredMode() { return showSpeedColors || showRoadQuality || showAveragedSegments || showBraking || showCrashes || !!activeFilter; }
 
 function updateStatsVisibility() {
   const statsEl = document.getElementById('stats');
@@ -697,7 +1106,7 @@ sensorLegendEl.addEventListener('scroll', () => {
 window.addEventListener('resize', updateStatsVisibility);
 
 function updateLegendPositions() {
-  const order   = ['averagedSegmentsLegend','speedLegend','roadQualityLegend','brakingLegend','sensorLegend'];
+  const order   = ['averagedSegmentsLegend','speedLegend','roadQualityLegend','brakingLegend','crashLegend','sensorLegend'];
   const visible = order.map(id => document.getElementById(id)).filter(el => el && el.style.display === 'block');
   const mobile  = window.matchMedia('(max-width: 768px)').matches;
   updateStatsVisibility();
@@ -870,6 +1279,7 @@ function setupControls() {
 
   setupAveragedSegmentControls();
   setupBrakingControls();
+  setupCrashControls();
 }
 
 function updateStatsFromMetadata() {

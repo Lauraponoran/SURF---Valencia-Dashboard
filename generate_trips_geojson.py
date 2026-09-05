@@ -105,23 +105,28 @@ marker_bounds as (
          order by d1.samples limit 1) as end_sample
     from params p
 ),
+-- Parse each raw_data blob exactly once. Without MATERIALIZED, Postgres is
+-- free to inline this subquery and re-run string_to_array/convert_from
+-- once per generate_series value below (20x per row) instead of once per
+-- row -- see csv_export_query.txt for the original diagnosis/benchmark.
+parsed as materialized (
+    select rd.samples,
+           string_to_array(
+               replace(replace(convert_from(rd.data, 'UTF8'), '[', ''), ']', ''),
+               ','
+           ) as vals
+    from public.raw_data rd
+    join marker_bounds mb on mb.trip_id = rd.trip_id
+    where rd.trip_id = (select trip_id from params)
+      and rd.samples >= mb.start_sample
+      and rd.samples - 9 <= mb.end_sample
+),
 x as (
     select
         rd.samples - 9 + gs.i as output_samples,
         trim(vals[gs.i * 4 + 1])::integer as acc_low,
         trim(vals[gs.i * 4 + 2])::integer as acc_high
-    from (
-        select rd.samples,
-               string_to_array(
-                   replace(replace(convert_from(rd.data, 'UTF8'), '[', ''), ']', ''),
-                   ','
-               ) as vals
-        from public.raw_data rd
-        join marker_bounds mb on mb.trip_id = rd.trip_id
-        where rd.trip_id = (select trip_id from params)
-          and rd.samples >= mb.start_sample
-          and rd.samples - 9 <= mb.end_sample
-    ) rd
+    from parsed rd
     cross join generate_series(0, 9) as gs(i)
 )
 select
@@ -151,8 +156,10 @@ order by "timestamp"
 """
 
 # 3. data1 anchors for sample→timestamp mapping (road quality lookup)
+#    h_rot is needed for crash detection's wheel-rotation checks (was the
+#    wheel turning before impact, speed-at-impact estimate).
 DATA1_QUERY = """
-select samples, "timestamp"
+select samples, "timestamp", h_rot
 from public.data1
 where trip_id = %(trip_id)s
 order by samples
@@ -250,6 +257,359 @@ def haversine(a, b):
     dlat = lat2 - lat1
     x = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     return R * 2 * math.atan2(math.sqrt(x), math.sqrt(1 - x))
+
+# ── Crash/fall detection (API path) — ported from Marineterrein-Commutes ────
+CRASH_IMPACT_THRESHOLD_G      = 6.0
+CRASH_CLUSTER_GAP_S           = 1.0
+CRASH_STALL_THRESHOLD_S       = 1.0
+CRASH_STOP_SEARCH_WINDOW_S    = 3.0
+# See Marineterrein-Commutes generate_trips_geojson.py for the full history
+# behind these thresholds (calibrated against confirmed real falls there).
+CRASH_SPEED_LOOKBACK_MAX_S    = 10.0
+CRASH_MAX_RECOVERY_S          = 120.0
+CRASH_SETTLE_WINDOW_S         = CRASH_STOP_SEARCH_WINDOW_S
+CRASH_SETTLE_DURATION_S       = 1.0
+CRASH_SETTLE_MAX_RANGE_G      = 3.0
+CRASH_GPS_STILL_MAX_SPEED_KMH = 5.5
+CRASH_COORD_STALL_RADIUS_M    = 5.0
+CRASH_BASELINE_WINDOW_S       = 3.0
+CRASH_BASELINE_DELTA_MIN_G    = 0.0
+CRASH_BURST_GAP_S             = CRASH_SETTLE_WINDOW_S
+
+CRASH_SEVERITY_BANDS = [
+    (6.0,  8.0,  "Minor"),
+    (8.0,  11.0, "Hard"),
+    (11.0, None, "Severe"),
+]
+
+# speed_at_impact_kmh comes from a wheel-rotation estimate, not GPS. An
+# estimate at or above this cap drops the whole crash event rather than
+# being clamped and reported as a fake, exact "40 km/h" — see
+# Marineterrein-Commutes for the full rationale.
+CRASH_SPEED_CAP_KMH = 40
+
+
+def _crash_severity(peak_g):
+    mag = abs(peak_g)
+    for low, high, label in CRASH_SEVERITY_BANDS:
+        if mag >= low and (high is None or mag < high):
+            return label
+    return "Minor"
+
+
+def _acc_y_settles_after_impact(points, spike_idx, end_idx, n, t_diff):
+    """
+    True if a post-impact acc_y window:
+      1. stays within CRASH_SETTLE_MAX_RANGE_G for >= CRASH_SETTLE_DURATION_S
+      2. has a mean shifted from the pre-impact baseline by at least
+         CRASH_BASELINE_DELTA_MIN_G
+    """
+    pre_samples = []
+    k = spike_idx - 1
+
+    while k >= 0 and t_diff(points[k], points[spike_idx]) <= CRASH_BASELINE_WINDOW_S:
+        pre_samples.append(points[k]["acc_y"])
+        k -= 1
+
+    if not pre_samples:
+        return False
+
+    baseline_mean = sum(pre_samples) / len(pre_samples)
+
+    win_start = end_idx
+    k = end_idx
+
+    while k < n:
+        while (
+            win_start < k
+            and t_diff(points[win_start], points[k]) > CRASH_SETTLE_DURATION_S
+        ):
+            win_start += 1
+
+        window_duration = t_diff(points[win_start], points[k])
+
+        if (
+            win_start < k
+            and window_duration >= CRASH_SETTLE_DURATION_S * 0.9
+        ):
+            window = points[win_start:k + 1]
+            vals = [p["acc_y"] for p in window]
+            value_range = max(vals) - min(vals)
+
+            if value_range <= CRASH_SETTLE_MAX_RANGE_G:
+                settled_mean = sum(vals) / len(vals)
+                delta = abs(settled_mean - baseline_mean)
+
+                if delta >= CRASH_BASELINE_DELTA_MIN_G:
+                    return True
+
+        if t_diff(points[end_idx], points[k]) > CRASH_SETTLE_WINDOW_S:
+            break
+
+        k += 1
+
+    return False
+
+def _gps_stops_after_impact(gnss, gnss_ts, onset_ts):
+    """
+    True if, within CRASH_SETTLE_WINDOW_S of onset_ts, GPS confirms the bike is stationary via:
+      1. Reported speed <= CRASH_GPS_STILL_MAX_SPEED_KMH for at least CRASH_SETTLE_DURATION_S.
+      2. Consecutive coordinate spread (haversine) <= CRASH_COORD_STALL_RADIUS_M over that window.
+    """
+    if not gnss_ts or onset_ts is None:
+        return False
+
+    pos = bisect.bisect_left(gnss_ts, onset_ts)
+    idx = pos
+    settle_fixes = []
+
+    while idx < len(gnss) and (gnss[idx]["timestamp"] - onset_ts).total_seconds() <= CRASH_SETTLE_WINDOW_S:
+        settle_fixes.append(gnss[idx])
+        idx += 1
+
+    if len(settle_fixes) < 2:
+        return False
+
+    run_start_ts = None
+    valid_speed_window = False
+
+    for fix in settle_fixes:
+        speed = float(fix["speed"] or 0)
+        if speed <= CRASH_GPS_STILL_MAX_SPEED_KMH:
+            if run_start_ts is None:
+                run_start_ts = fix["timestamp"]
+            elif (fix["timestamp"] - run_start_ts).total_seconds() >= CRASH_SETTLE_DURATION_S:
+                valid_speed_window = True
+                break
+        else:
+            run_start_ts = None
+
+    if not valid_speed_window:
+        return False
+
+    max_dist = 0.0
+    for i in range(len(settle_fixes)):
+        for j in range(i + 1, len(settle_fixes)):
+            d = haversine(settle_fixes[i], settle_fixes[j])
+            if d > max_dist:
+                max_dist = d
+
+    return max_dist <= CRASH_COORD_STALL_RADIUS_M
+
+
+def detect_crash_events_api(raw_rows, raw_cols, d1_rows, d1_cols,
+                             gnss_rows, gnss_cols, trip_id, wheel_diam_mm):
+    """
+    Detect crash/fall events for a Supabase-fetched trip. See
+    Marineterrein-Commutes generate_trips_geojson.py for the full two-pass
+    algorithm writeup (cluster impact spikes into "throws", group throws
+    into bursts, gate once per burst on settle/GPS-stop/was-moving).
+    """
+    if not raw_rows or not d1_rows:
+        return []
+
+    raw = sorted(
+        (dict(zip(raw_cols, r)) for r in raw_rows),
+        key=lambda r: r["samples"]
+    )
+    d1 = sorted(
+        (dict(zip(d1_cols, r)) for r in d1_rows),
+        key=lambda r: r["samples"]
+    )
+    gnss = [dict(zip(gnss_cols, r)) for r in gnss_rows] if gnss_rows else []
+
+    d1_samples = [r["samples"] for r in d1]
+    gnss_ts    = [r["timestamp"] for r in gnss] if gnss else []
+
+    def nearest_d1(sample_idx):
+        pos = bisect.bisect_left(d1_samples, sample_idx)
+        if pos == 0:
+            return d1[0]
+        if pos >= len(d1_samples):
+            return d1[-1]
+        before, after = d1[pos - 1], d1[pos]
+        return before if abs(before["samples"] - sample_idx) <= abs(after["samples"] - sample_idx) else after
+
+    def nearest_gnss(ts):
+        if not gnss_ts or ts is None:
+            return None
+        pos = bisect.bisect_left(gnss_ts, ts)
+        if pos == 0:
+            return gnss[0]
+        if pos >= len(gnss_ts):
+            return gnss[-1]
+        before, after = gnss[pos - 1], gnss[pos]
+        return before if abs((before["timestamp"] - ts).total_seconds()) <= abs((after["timestamp"] - ts).total_seconds()) else after
+
+    points = []
+    for r in raw:
+        anchor = nearest_d1(r["samples"])
+        points.append({
+            "samples": r["samples"],
+            "acc_y":   float(r["acc_y"] or 0),
+            "time":    anchor["timestamp"],
+            "hrot":    anchor.get("h_rot") or 0,
+        })
+
+    if len(points) < 3:
+        return []
+
+    def t_diff(a, b):
+        sample_estimate = (b["samples"] - a["samples"]) * 0.02  # 50Hz fallback
+        if a["time"] and b["time"]:
+            delta = (b["time"] - a["time"]).total_seconds()
+            if a["samples"] == b["samples"]:
+                return delta
+            if delta != 0:
+                return max(delta, sample_estimate)
+        return sample_estimate
+
+    wheel_circumference_m = (wheel_diam_mm / 1000) * math.pi if wheel_diam_mm else None
+
+    def wheel_rotation_lookback(idx):
+        """
+        Walk back from points[idx] until hitting a data1 anchor with a
+        DIFFERENT h_rot reading, capped at CRASH_SPEED_LOOKBACK_MAX_S.
+        Returns (hrot_diff, lb_time_s).
+        """
+        lb_idx = idx
+        while (
+            lb_idx > 0
+            and points[lb_idx]["hrot"] == points[idx]["hrot"]
+            and t_diff(points[lb_idx], points[idx]) < CRASH_SPEED_LOOKBACK_MAX_S
+        ):
+            lb_idx -= 1
+        hrot_diff = points[idx]["hrot"] - points[lb_idx]["hrot"]
+        lb_time_s = t_diff(points[lb_idx], points[idx])
+        return hrot_diff, lb_time_s
+
+    # ── Pass 1: cluster raw over-threshold samples into discrete throws ────
+    throws = []
+    i, n = 0, len(points)
+    while i < n:
+        if abs(points[i]["acc_y"]) >= CRASH_IMPACT_THRESHOLD_G:
+            start = i
+            end = i
+            j = i + 1
+            while j < n:
+                if t_diff(points[end], points[j]) > CRASH_CLUSTER_GAP_S:
+                    break
+                if abs(points[j]["acc_y"]) >= CRASH_IMPACT_THRESHOLD_G:
+                    end = j
+                j += 1
+
+            peak_idx = max(range(start, end + 1), key=lambda k: abs(points[k]["acc_y"]))
+            throws.append({
+                "start":    start,
+                "end":      end,
+                "peak_idx": peak_idx,
+                "peak_g":   points[peak_idx]["acc_y"],
+                "onset_ts": points[start]["time"],
+            })
+            i = end + 1
+        else:
+            i += 1
+
+    if not throws:
+        return []
+
+    # ── Pass 2: group throws into bursts, gate once per burst ──────────────
+    bursts = [[throws[0]]]
+    for throw in throws[1:]:
+        prev_end = bursts[-1][-1]["end"]
+        if t_diff(points[prev_end], points[throw["start"]]) <= CRASH_BURST_GAP_S:
+            bursts[-1].append(throw)
+        else:
+            bursts.append([throw])
+
+    events = []
+    for burst in bursts:
+        first_throw, last_throw = burst[0], burst[-1]
+
+        acc_ok = _acc_y_settles_after_impact(
+            points, first_throw["start"], last_throw["end"], n, t_diff
+        )
+        gps_ok = _gps_stops_after_impact(gnss, gnss_ts, last_throw["onset_ts"])
+
+        moving_ok = True
+        if wheel_circumference_m:
+            hrot_diff_pre, _ = wheel_rotation_lookback(first_throw["start"])
+            moving_ok = hrot_diff_pre > 0
+
+        if not (acc_ok and gps_ok and moving_ok):
+            continue
+
+        for throw in burst:
+            start, end   = throw["start"], throw["end"]
+            peak_idx     = throw["peak_idx"]
+            peak_g       = throw["peak_g"]
+            onset_ts     = throw["onset_ts"]
+
+            b_idx = start
+            while b_idx > max(0, start - 25) and abs(points[b_idx]["acc_y"]) > 1.0:
+                b_idx -= 1
+            suddenness_s = round(t_diff(points[b_idx], points[peak_idx]), 2)
+
+            speed_kmh = None
+            if wheel_circumference_m:
+                hrot_diff, lb_time_s = wheel_rotation_lookback(start)
+                if hrot_diff > 0 and lb_time_s and lb_time_s >= 0.02:
+                    revolutions   = hrot_diff / 2.0
+                    distance_m    = revolutions * wheel_circumference_m
+                    raw_speed_kmh = (distance_m / lb_time_s) * 3.6
+                    if raw_speed_kmh >= CRASH_SPEED_CAP_KMH:
+                        continue
+                    speed_kmh = round(raw_speed_kmh, 1)
+
+            came_to_stop = False
+            recovery_time_s = None
+            unresolved = False
+            cursor = end
+            while cursor < n - 1 and t_diff(points[end], points[cursor]) <= CRASH_STOP_SEARCH_WINDOW_S:
+                hrot_now = points[cursor]["hrot"]
+                k = cursor + 1
+                while k < n and points[k]["hrot"] == hrot_now:
+                    k += 1
+                if k >= n:
+                    unresolved = True
+                    break
+                gap = t_diff(points[cursor], points[k])
+                if gap >= CRASH_STALL_THRESHOLD_S:
+                    came_to_stop = True
+                    recovery_time_s = round(gap, 2)
+                    break
+                cursor = k
+
+            fix = nearest_gnss(onset_ts)
+            if fix is None:
+                continue
+
+            if not came_to_stop or recovery_time_s > CRASH_MAX_RECOVERY_S:
+                continue
+
+            events.append({
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [float(fix["longitude"]), float(fix["latitude"])],
+                },
+                "properties": {
+                    "event_type":           "crash",
+                    "trip_id":              trip_id,
+                    "peak_g":               round(peak_g, 2),
+                    "severity":             _crash_severity(peak_g),
+                    "suddenness_s":         suddenness_s,
+                    "speed_at_impact_kmh":  speed_kmh,
+                    "came_to_stop":         came_to_stop,
+                    "recovery_time_s":      recovery_time_s,
+                    "unresolved":           unresolved,
+                    "time_str":             onset_ts.strftime("%H:%M:%S") if onset_ts else None,
+                    "location_approximate": True,
+                },
+            })
+
+    return events
+
 
 def privacy_trim(rows):
     if len(rows) < 2:
@@ -410,9 +770,17 @@ def load_remote_trips():
             )
 
             braking_count = sum(1 for f in new_feats if f["properties"]["is_braking"])
+
+            crash_feats = detect_crash_events_api(
+                raw_rows, raw_cols, d1_rows, d1_cols,
+                gnss_rows, gnss_cols, trip_id, wheel_diam_mm
+            )
+            new_feats.extend(crash_feats)
+
             features.extend(new_feats)
             print(f"  ✅ {trip_id}: {len(gnss_rows)} gnss pts → {len(new_feats)} segments"
-                  + (f" | 🛑 {braking_count} braking events" if braking_count else ""))
+                  + (f" | 🛑 {braking_count} braking events" if braking_count else "")
+                  + (f" | 🚨 {len(crash_feats)} crash events" if crash_feats else ""))
 
         except Exception as e:
             print(f"  ❌ {trip_id}: {e}")
@@ -446,6 +814,10 @@ def main():
     # Braking summary
     total_braking = sum(1 for f in all_features if f['properties'].get('is_braking'))
     print(f"   Total braking events: {total_braking}")
+
+    # Crash summary
+    total_crashes = sum(1 for f in all_features if f['properties'].get('event_type') == 'crash')
+    print(f"   Total crash/fall events: {total_crashes}")
 
 if __name__ == "__main__":
     main()

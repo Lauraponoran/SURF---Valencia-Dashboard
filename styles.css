@@ -808,7 +808,8 @@ input[type="range"] {
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   box-shadow: -2px 0 10px rgba(0,0,0,0.25);
-  z-index: 210;
+  z-index: 10000; /* above #controlsTab's 9999, so it fully covers the
+                      Filters toggle when open, incl. in fullscreen */
   display: flex;
   flex-direction: column;
   transition: right 0.3s ease;
